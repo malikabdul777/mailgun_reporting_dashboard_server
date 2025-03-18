@@ -73,7 +73,7 @@ const getDomainStats = async (req, res) => {
     }).toString();
 
     // Fetch stats for multiple events in parallel
-    const events = ["accepted", "delivered", "failed"];
+    const events = ["accepted", "delivered", "failed", "opened", "clicked"];
     const statsPromises = events.map((event) =>
       axios.get(
         `https://api.mailgun.net/v3/${domain}/stats/total?${query}&event=${event}`,
@@ -144,7 +144,7 @@ const getOverallStats = async (req, res) => {
       end,
     }).toString();
 
-    const events = ["accepted", "delivered", "failed"];
+    const events = ["accepted", "delivered", "failed", "opened", "clicked"];
     const statsPromises = events.map((event) =>
       axios.get(
         `https://api.mailgun.net/v3/stats/total?${query}&event=${event}`,
