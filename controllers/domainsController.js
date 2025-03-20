@@ -1,5 +1,8 @@
 const axios = require("axios");
 
+// Common timeout value for all API requests
+const API_TIMEOUT = 10000; // 10 seconds
+
 const getDomains = async (req, res) => {
   try {
     const { account } = req.params;
@@ -12,13 +15,37 @@ const getDomains = async (req, res) => {
       });
     }
 
-    const response = await axios.get("https://api.mailgun.net/v4/domains", {
+    // Create an axios instance with timeout and retry logic
+    const mailgunApi = axios.create({
+      timeout: API_TIMEOUT,
       headers: {
         Authorization:
           "Basic " + Buffer.from(`api:${apiKey}`).toString("base64"),
         "Content-Type": "application/json",
       },
     });
+
+    // Add retry with exponential backoff
+    let retries = 0;
+    const maxRetries = 3;
+    let response;
+
+    while (retries < maxRetries) {
+      try {
+        response = await mailgunApi.get("https://api.mailgun.net/v4/domains");
+        break; // Success, exit the retry loop
+      } catch (error) {
+        retries++;
+        if (retries >= maxRetries) throw error; // Max retries reached, rethrow
+
+        // Exponential backoff: wait longer between each retry
+        const delay = Math.pow(2, retries) * 500; // 1s, 2s, 4s
+        console.warn(
+          `Retry ${retries}/${maxRetries} for domains after ${delay}ms`
+        );
+        await new Promise((resolve) => setTimeout(resolve, delay));
+      }
+    }
 
     return res.status(200).json({
       success: true,
@@ -72,26 +99,61 @@ const getDomainStats = async (req, res) => {
       end,
     }).toString();
 
-    // Fetch stats for multiple events in parallel
-    const events = ["accepted", "delivered", "failed", "opened", "clicked"];
-    const statsPromises = events.map((event) =>
-      axios.get(
-        `https://api.mailgun.net/v3/${domain}/stats/total?${query}&event=${event}`,
-        {
-          headers: {
-            Authorization:
-              "Basic " + Buffer.from(`api:${apiKey}`).toString("base64"),
-            "Content-Type": "application/json",
-          },
-        }
-      )
-    );
+    // Create an axios instance with timeout
+    const mailgunApi = axios.create({
+      timeout: API_TIMEOUT,
+      headers: {
+        Authorization:
+          "Basic " + Buffer.from(`api:${apiKey}`).toString("base64"),
+        "Content-Type": "application/json",
+      },
+    });
 
-    const responses = await Promise.all(statsPromises);
-    const combinedStats = responses.reduce((acc, response, index) => {
-      acc[events[index]] = response.data;
-      return acc;
-    }, {});
+    // Fetch stats for multiple events in parallel with improved error handling
+    const events = ["accepted", "delivered", "failed", "opened", "clicked"];
+
+    // Use a more efficient approach with Promise.allSettled and better error handling
+    const statsPromises = events.map((event) => {
+      const url = `https://api.mailgun.net/v3/${domain}/stats/total?${query}&event=${event}`;
+      return mailgunApi.get(url).catch((error) => {
+        // Detailed error logging
+        console.warn(
+          `Error fetching stats for ${domain}, event ${event}:`,
+          error.message
+        );
+        if (error.response) {
+          console.warn(
+            `Status: ${error.response.status}, Data:`,
+            error.response.data
+          );
+        }
+        // Return a placeholder for failed requests
+        return {
+          data: {
+            event,
+            items: [],
+            message: "Failed to fetch data",
+            error: error.message,
+          },
+        };
+      });
+    });
+
+    const responses = await Promise.allSettled(statsPromises);
+    const combinedStats = {};
+
+    // Process responses, including those that failed
+    responses.forEach((result, index) => {
+      const event = events[index];
+      if (result.status === "fulfilled" && result.value.data) {
+        combinedStats[event] = result.value.data;
+      } else {
+        combinedStats[event] = {
+          error: true,
+          message: result.reason?.message || "Failed to fetch data",
+        };
+      }
+    });
 
     return res.status(200).json({
       success: true,
@@ -111,6 +173,9 @@ const getOverallStats = async (req, res) => {
   try {
     const { account } = req.params;
     let { start, end } = req.query;
+
+    // Set a reasonable timeout for API requests
+    const timeout = 10000; // 10 seconds
 
     // Convert dates to RFC 2822 format
     start = new Date(start).toUTCString();
@@ -145,24 +210,49 @@ const getOverallStats = async (req, res) => {
     }).toString();
 
     const events = ["accepted", "delivered", "failed", "opened", "clicked"];
+
+    // Create an axios instance with timeout
+    const mailgunApi = axios.create({
+      timeout,
+      headers: {
+        Authorization:
+          "Basic " + Buffer.from(`api:${apiKey}`).toString("base64"),
+        "Content-Type": "application/json",
+      },
+    });
+
+    // Use Promise.allSettled instead of Promise.all to handle partial failures
     const statsPromises = events.map((event) =>
-      axios.get(
-        `https://api.mailgun.net/v3/stats/total?${query}&event=${event}`,
-        {
-          headers: {
-            Authorization:
-              "Basic " + Buffer.from(`api:${apiKey}`).toString("base64"),
-            "Content-Type": "application/json",
-          },
-        }
-      )
+      mailgunApi
+        .get(`https://api.mailgun.net/v3/stats/total?${query}&event=${event}`)
+        .catch((error) => {
+          console.warn(
+            `Error fetching stats for event ${event}:`,
+            error.message
+          );
+          // Return a placeholder for failed requests
+          return {
+            data: { event, items: [], message: "Failed to fetch data" },
+          };
+        })
     );
 
-    const responses = await Promise.all(statsPromises);
-    const combinedStats = responses.reduce((acc, response, index) => {
-      acc[events[index]] = response.data;
-      return acc;
-    }, {});
+    const responses = await Promise.allSettled(statsPromises);
+    const combinedStats = {};
+
+    // Process responses, including those that failed
+    responses.forEach((result, index) => {
+      const event = events[index];
+      if (result.status === "fulfilled" && result.value.data) {
+        combinedStats[event] = result.value.data;
+      } else {
+        // Include error information in the response
+        combinedStats[event] = {
+          error: true,
+          message: result.reason?.message || "Failed to fetch data",
+        };
+      }
+    });
 
     return res.status(200).json({
       success: true,
@@ -220,24 +310,52 @@ const getDomainEvents = async (req, res) => {
     const beginRFC = beginDate.toUTCString();
     const endRFC = endDate.toUTCString();
 
+    // Use default values for optional parameters
+    const eventType = event || "failed";
+    const ascendingValue = ascending || "yes";
+    const limitValue = limit || 300;
+
     const query = new URLSearchParams({
       begin: beginRFC,
       end: endRFC,
-      ascending: ascending || "yes",
-      limit: limit || 300,
-      event: event || "failed",
+      ascending: ascendingValue,
+      limit: limitValue,
+      event: eventType,
     }).toString();
 
-    const response = await axios.get(
-      `https://api.mailgun.net/v3/${domain}/events?${query}`,
-      {
-        headers: {
-          Authorization:
-            "Basic " + Buffer.from(`api:${apiKey}`).toString("base64"),
-          "Content-Type": "application/json",
-        },
+    // Create an axios instance with timeout
+    const mailgunApi = axios.create({
+      timeout: API_TIMEOUT,
+      headers: {
+        Authorization:
+          "Basic " + Buffer.from(`api:${apiKey}`).toString("base64"),
+        "Content-Type": "application/json",
+      },
+    });
+
+    // Add retry logic for reliability
+    let retries = 0;
+    const maxRetries = 2;
+    let response;
+
+    while (retries <= maxRetries) {
+      try {
+        response = await mailgunApi.get(
+          `https://api.mailgun.net/v3/${domain}/events?${query}`
+        );
+        break; // Success, exit the retry loop
+      } catch (error) {
+        retries++;
+        if (retries > maxRetries) throw error; // Max retries reached, rethrow
+
+        // Exponential backoff
+        const delay = Math.pow(2, retries) * 500;
+        console.warn(
+          `Retry ${retries}/${maxRetries} for domain events after ${delay}ms`
+        );
+        await new Promise((resolve) => setTimeout(resolve, delay));
       }
-    );
+    }
 
     return res.status(200).json({
       success: true,
@@ -285,14 +403,46 @@ const getEventsPagination = async (req, res) => {
     // Decode the URL if it's encoded
     const decodedUrl = decodeURIComponent(url);
 
-    // Make request to the provided pagination URL
-    const response = await axios.get(decodedUrl, {
+    // Validate the URL to ensure it's a Mailgun API URL for security
+    if (!decodedUrl.startsWith("https://api.mailgun.net/")) {
+      return res.status(400).json({
+        success: false,
+        message: "Invalid URL: Only Mailgun API URLs are allowed",
+      });
+    }
+
+    // Create an axios instance with timeout
+    const mailgunApi = axios.create({
+      timeout: API_TIMEOUT,
       headers: {
         Authorization:
           "Basic " + Buffer.from(`api:${apiKey}`).toString("base64"),
         "Content-Type": "application/json",
       },
     });
+
+    // Add retry logic for reliability
+    let retries = 0;
+    const maxRetries = 2;
+    let response;
+
+    while (retries <= maxRetries) {
+      try {
+        // Make request to the provided pagination URL
+        response = await mailgunApi.get(decodedUrl);
+        break; // Success, exit the retry loop
+      } catch (error) {
+        retries++;
+        if (retries > maxRetries) throw error; // Max retries reached, rethrow
+
+        // Exponential backoff
+        const delay = Math.pow(2, retries) * 500;
+        console.warn(
+          `Retry ${retries}/${maxRetries} for pagination URL after ${delay}ms`
+        );
+        await new Promise((resolve) => setTimeout(resolve, delay));
+      }
+    }
 
     return res.status(200).json({
       success: true,
